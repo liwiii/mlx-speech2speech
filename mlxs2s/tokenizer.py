@@ -1,17 +1,9 @@
-import ipdb
 import json
-from pathlib import Path, PosixPath
+from pathlib import Path
 from typing import Dict
 from tokenizers import AddedToken, Tokenizer
+from mlxs2s.utils import check_file
 import mlx.core as mx
-# from transformers import Qwen2TokenizerFast
-
-
-def check_file(file_path: PosixPath):
-    if not file_path.is_file():
-        raise FileNotFoundError(f"Can not find necessary file: {file_path}")
-    else:
-        return file_path
 
 
 class MLXQwen2Tokenizer:
@@ -23,9 +15,9 @@ class MLXQwen2Tokenizer:
         "pad_token",
         "cls_token",
         "mask_token",
-        "additional_special_tokens",
+        "additional_special_tokens"
     ]
-    model_input_names = ["input_ids", "attention_mask"]
+    # model_input_names = ["input_ids", "attention_mask"]
     truncation_side = "right"
 
     def __init__(self, model_path: str):
