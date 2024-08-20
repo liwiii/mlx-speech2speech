@@ -1,8 +1,9 @@
-# import ipdb
+import ipdb
 import json
 from pathlib import Path, PosixPath
 from typing import Dict
 from tokenizers import AddedToken, Tokenizer
+import mlx.core as mx
 # from transformers import Qwen2TokenizerFast
 
 
@@ -24,11 +25,13 @@ class MLXQwen2Tokenizer:
         "mask_token",
         "additional_special_tokens",
     ]
+    model_input_names = ["input_ids", "attention_mask"]
+    truncation_side = "right"
 
     def __init__(self, model_path: str):
         resolved_vocab_files = {
-            'vocab_file': check_file(Path(model_path)/'vocab.json'),
-            'merges_file': check_file(Path(model_path)/'merges.txt'),
+            # 'vocab_file': check_file(Path(model_path)/'vocab.json'),
+            # 'merges_file': check_file(Path(model_path)/'merges.txt'),
             'tokenizer_file': check_file(Path(model_path)/'tokenizer.json'),
             'tokenizer_config_file': check_file(Path(model_path)/'tokenizer_config.json')
         }
@@ -56,38 +59,98 @@ class MLXQwen2Tokenizer:
                     str(config_kwargs[key]), config_kwargs[key])
 
         # ipdb.set_trace()
-        self.bos_token = config_kwargs.pop('bos_token')  # -> None
-        self.eos_token = config_kwargs.pop('eos_token')  # -> AddedToken()
-        self.unk_token = config_kwargs.pop('unk_token')  # -> None
-        self.pad_token = config_kwargs.pop('pad_token')  # -> AddedToken()
-        self.additional_special_tokens = config_kwargs.pop(
-            'additional_special_tokens')  # -> list
+        self.bos_token = config_kwargs['bos_token']  # -> None
+        self.eos_token = config_kwargs['eos_token']  # -> AddedToken()
+        self.unk_token = config_kwargs['unk_token']  # -> None
+        self.pad_token = config_kwargs['pad_token']  # -> AddedToken()
+        self.additional_special_tokens = config_kwargs['additional_special_tokens']  # -> list
 
         # from class PretrainedTokenizerFast
-        self.tokenizer = Tokenizer.from_file(
-            str(config_kwargs.pop("tokenizer_file")))
+        self.tokenizer = Tokenizer.from_file(str(config_kwargs["tokenizer_file"]))
         self.tokenizer.no_truncation()
 
         # from class PreTrainedTokenizerBase
-        model_max_length = config_kwargs.pop("model_max_length")  # 8192
-        self.model_max_length = model_max_length
-        self.padding_side = config_kwargs.pop("padding_side")
+        self.model_max_length = config_kwargs["model_max_length"]  # 8192
+        self.padding_side = config_kwargs["padding_side"]  # left
 
-        self.model_input_names = ['input_ids', 'attention_mask']  # hardcode
+        self.truncation_side = config_kwargs.pop("truncation_side", self.truncation_side)
+        self.clean_up_tokenization_spaces = config_kwargs["clean_up_tokenization_spaces"]  # False
+        self.split_special_tokens = config_kwargs["split_special_tokens"]  # False
+        self.chat_template = config_kwargs["chat_template"]  # str
 
-        self.clean_up_tokenization_spaces = config_kwargs.pop(
-            "clean_up_tokenization_spaces")  # False
-        self.split_special_tokens = config_kwargs.pop(
-            "split_special_tokens")  # False
-        self.chat_template = config_kwargs.pop("chat_template")  # str
+        self.tokenizer.encode_special_tokens = self.split_special_tokens
+
+        added_tokens_decoder_hash = {hash(repr(token)) for token in self.tokenizer.get_added_tokens_decoder()}
+        tokens_to_add = [
+            token for index, token in
+            sorted(added_tokens_decoder.items(), key=lambda x: x[0])
+            if hash(repr(token)) not in added_tokens_decoder_hash
+        ]
+
+        added_tokens_encoder = {
+            k.content: v for v, k in
+            sorted(self.tokenizer.get_added_tokens_decoder().items(), key=lambda item: item[0])
+        }
+        encoder = [added_tokens_encoder.keys()] + [str(token) for token in tokens_to_add]
+        # ipdb.set_trace()
+
+        tokens_to_add += [
+            token for token in
+            self.all_special_tokens_extended
+            if token not in encoder and token not in tokens_to_add
+        ]
+
+        special_tokens = [str(s) for s in self.all_special_tokens_extended]
+        is_last_special = None
+        tokens = []
+        for token in tokens_to_add:
+            is_special = (
+                (token.special or str(token) in special_tokens)
+                if isinstance(token, AddedToken)
+                else str(token) in special_tokens
+            )
+            if is_last_special is None or is_last_special == is_special:
+                tokens.append(token)
+            else:
+                self._add_tokens(tokens, special_tokens=is_last_special)
+                tokens = [token]
+            is_last_special = is_special
+        if tokens:
+            self._add_tokens(tokens, special_tokens=is_last_special)
+
+    @property
+    def special_tokens_map_extended(self):
+        set_attr = {}
+        set_attr['eos_token'] = self.eos_token
+        set_attr['pad_token'] = self.pad_token
+        set_attr['additional_special_tokens'] = self.additional_special_tokens
+        return set_attr
+
+    @property
+    def all_special_tokens_extended(self):
+        all_tokens = []
+        seen = set()
+        for value in self.special_tokens_map_extended.values():
+            if isinstance(value, (list, tuple)):
+                tokens_to_add = [token for token in value if str(token) not in seen]
+            else:
+                tokens_to_add = [value] if str(value) not in seen else []
+            seen.update(map(str, tokens_to_add))
+            all_tokens.extend(tokens_to_add)
+        return all_tokens
+
+    def _add_tokens(self, new_tokens, special_tokens=False):
+        if special_tokens:
+            return self.tokenizer.add_special_tokens(new_tokens)
+
+        return self.tokenizer.add_tokens(new_tokens)
 
     def __call__(self, text: str, padding: bool = True):
         encodings = self.tokenizer.encode_batch([text],
                                                 add_special_tokens=True,
                                                 is_pretokenized=False)[0]
         encoding_dict = {}
-        encoding_dict['input_ids'] = encodings.ids
-        encoding_dict["attention_mask"] = encodings.attention_mask
+        encoding_dict['input_ids'] = mx.array(encodings.ids)
+        encoding_dict["attention_mask"] = mx.array(encodings.attention_mask)
 
         return encoding_dict
-
