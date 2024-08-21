@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 import numpy as np
 from mlxs2s.utils import check_file
-import torch
 import mlx.core as mx
 
 
@@ -107,7 +106,6 @@ def mel_filter_bank(
 
 
 class MLXQwen2FeatureExtractor:
-
     def __init__(self, model_path: str):
         preprocessor_config_file = check_file(Path(model_path)/'preprocessor_config.json')
         with open(preprocessor_config_file, encoding="utf-8") as handle:
@@ -123,16 +121,19 @@ class MLXQwen2FeatureExtractor:
         self.n_samples = self.chunk_length * self.sampling_rate  # 480000
         self.nb_max_frames = self.n_samples // self.hop_length  # 100
 
-        self.mel_filters = mel_filter_bank(
+        self.mel_filters = mx.array(mel_filter_bank(
             num_frequency_bins=1 + self.n_fft // 2,
             num_mel_filters=self.feature_size,
             min_frequency=0.0,
-            max_frequency=8000.0,
+            max_frequency=self.sampling_rate/2,
             sampling_rate=self.sampling_rate,
             norm="slaney",
             mel_scale="slaney",
-        )
-
+        ))
+        self.m_window = mx.array(np.hanning(self.n_fft + 1)[:-1])
+        # self.t_window = torch.hann_window(self.n_fft)
+    
+    '''
     def _torch_extract_fbank_features(self, waveform: np.array, device: str = "cpu") -> np.ndarray:
         waveform = torch.from_numpy(waveform).type(torch.float32)
 
@@ -140,7 +141,7 @@ class MLXQwen2FeatureExtractor:
         if device != "cpu":
             waveform = waveform.to(device)
             window = window.to(device)
-        stft = torch.stft(waveform, self.n_fft, self.hop_length, window=window, return_complex=True)
+        stft = torch.stft(waveform, self.n_fft, self.hop_length, window=window, center=False, return_complex=True)
         magnitudes = stft[..., :-1].abs() ** 2
 
         mel_filters = torch.from_numpy(self.mel_filters).type(torch.float32)
@@ -158,39 +159,21 @@ class MLXQwen2FeatureExtractor:
         if device != "cpu":
             log_spec = log_spec.detach().cpu()
         return log_spec.numpy()
+    '''
 
-    def _mlx_extract_fbank_features(self, waveform: np.array, device: str = "cpu") -> np.ndarray:
-        def hanning(size):
-            return mx.array(np.hanning(size + 1)[:-1])
-
-        waveform = mx.array(waveform).astype(mx.float32)
-        window = hanning(self.n_fft)
-
-        if device != "cpu":
-            waveform = waveform.to(device)
-            window = window.to(device)
-        stft = torch.stft(waveform, self.n_fft, self.hop_length, window=window, return_complex=True)
-        magnitudes = stft[..., :-1].abs() ** 2
-
-        mel_filters = torch.from_numpy(self.mel_filters).type(torch.float32)
-        if device != "cpu":
-            mel_filters = mel_filters.to(device)
-        mel_spec = mel_filters.T @ magnitudes
-
-        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-        if waveform.dim() == 2:
-            max_val = log_spec.max(dim=2, keepdim=True)[0].max(dim=1, keepdim=True)[0]
-            log_spec = torch.maximum(log_spec, max_val - 8.0)
-        else:
-            log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
-        log_spec = (log_spec + 4.0) / 4.0
-        if device != "cpu":
-            log_spec = log_spec.detach().cpu()
-        return log_spec.numpy()
+    def _mlx_extract_fbank_features(self, waveform, device=mx.cpu):
+        with mx.stream(device):
+            waveform = mx.array(waveform)
+            shape = [(waveform.shape[0]-self.n_fft+self.hop_length)//self.hop_length, self.n_fft]
+            strides = [self.hop_length, 1]
+            stft = mx.fft.rfft(mx.as_strided(waveform, shape=shape, strides=strides) * self.m_window)
+            magnitudes = stft.abs().square()
+            mel_spec = magnitudes @ self.mel_filters
+            log_spec = mx.clip(mel_spec, a_min=1e-10, a_max=None).log10()
+            log_spec = mx.maximum(log_spec, log_spec.max() - 8.0)
+            log_spec = (log_spec + 4.0) / 4.0
+            mx.eval(log_spec)
+        return log_spec
 
     def __call__(self, raw_speech):
-        torch_out = self._torch_extract_fbank_features(raw_speech[0])
-        mlx_out = self._mlx_extract_fbank_features(raw_speech[0])
-
-        return (torch_out, mlx_out)
-
+        return self._mlx_extract_fbank_features(raw_speech[0])
