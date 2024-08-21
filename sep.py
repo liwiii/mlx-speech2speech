@@ -53,7 +53,7 @@ conversation = [
 ]
 
 # process = Qwen2AudioProcessor.from_pretrained(QWEN2_AUDIO_MODEL_PATH)
-ipdb.set_trace()
+# ipdb.set_trace()
 tokenizer = Qwen2TokenizerFast.from_pretrained(QWEN2_AUDIO_MODEL_PATH)
 feature_extractor = WhisperFeatureExtractor.from_pretrained(QWEN2_AUDIO_MODEL_PATH)
 
@@ -75,12 +75,13 @@ for message in conversation:
                                     sr=feature_extractor.sampling_rate)[0])
 
 inputs = tokenizer(text, padding=True, return_tensors="pt")
-ipdb.set_trace()
+# ipdb.set_trace()
 audio_inputs = feature_extractor(audios,
                                  sampling_rate=feature_extractor.sampling_rate,
                                  return_attention_mask=True,
                                  padding="max_length",
                                  return_tensors="pt")
+# ipdb.set_trace()
 
 audio_inputs["feature_attention_mask"] = audio_inputs.pop("attention_mask")
 inputs.update(audio_inputs)
