@@ -429,13 +429,11 @@ class Qwen2Model(nn.Module):
         # self.padding_idx = config['pad_token_id'
         self.vocab_size = config['vocab_size']
 
-        self.embed_tokens = nn.Embedding(
-            config['vocab_size'], config['hidden_size'])
+        self.embed_tokens = nn.Embedding(config['vocab_size'], config['hidden_size'])
         self.layers = [
             Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config['num_hidden_layers'])
         ]
-        self.norm = Qwen2RMSNorm(
-            config['hidden_size'], eps=config['rms_norm_eps'])
+        self.norm = Qwen2RMSNorm(config['hidden_size'], eps=config['rms_norm_eps'])
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -685,7 +683,17 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         # self.load_weights(list(mx_weights.items()))
         self.load_weights(list(mx_weights.items()))
 
+    def forward(self, input_ids, input_features, **kwargs):
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        input_feature_len = input_features.shape[1]
+        input_lengths = (input_feature_len - 1) // 2 + 1
+        output_lengths = (input_feature_len - 2) // 2 + 1
+
+        print(inputs_embeds)
+        return inputs_embeds
+        # input_embeds = self.audio_tower(input_ids)
         # print(mx_weights)
         # self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         # # set it to left by default, user can use setter to change padding_sides
-       # self._padding_side = "left"
+        # self._padding_side = "left"
