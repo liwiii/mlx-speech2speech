@@ -25,6 +25,7 @@ model.eval()
 
 
 mlx_input = mlx_tokenizer(TEXT)
+# ipdb.set_trace()
 audios = []
 for message in conversation:
     if isinstance(message["content"], list):

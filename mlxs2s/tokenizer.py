@@ -142,7 +142,7 @@ class MLXQwen2Tokenizer:
                                                 add_special_tokens=True,
                                                 is_pretokenized=False)[0]
         encoding_dict = {}
-        encoding_dict['input_ids'] = mx.array(encodings.ids)
+        encoding_dict['input_ids'] = mx.array(encodings.ids)[None,]
         encoding_dict["attention_mask"] = mx.array(encodings.attention_mask)
 
         return encoding_dict

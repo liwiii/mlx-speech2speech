@@ -4,11 +4,14 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 from mlxs2s.utils import check_file
+import numpy as np
 
 ACT2FN = {
     'silu': nn.SiLU,
     'gelu': nn.GELU,
 }
+
+AUDIO_TOKEN_INDEX = 151646  # hard code in Qwen2AudioConfig.__init__()
 
 Qwen2Config = {
     'vocab_size': 151936,
@@ -73,6 +76,7 @@ class Qwen2AudioAttention(nn.Module):
 
         B, L, D = hidden_states.shape
 
+        # TODO: fuse QKV for better performance
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
         values = self.v_proj(hidden_states)
@@ -304,7 +308,6 @@ class Qwen2AudioEncoder(nn.Module):
         self.activation_function = config['activation_function']  # gelu
         self.scale_embedding = config['scale_embedding']  # false
         self.max_source_positions = config['max_source_positions']  # 1500
-        print(config)
 
         self.config = config
 
@@ -335,16 +338,13 @@ class Qwen2AudioEncoder(nn.Module):
         for idx, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(hidden_states)
 
-        # hidden_states = mx.permute_dims(hidden_states, (0, 2, 1))
-        # hidden_states = self.avg_pooler(hidden_states)
-        # hidden_states = mx.permute_dims(hidden_states, (0, 2, 1))
-
         # According to https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary/mlx.nn.AvgPool1d.html
         # Assuming an input of shape (N, L, C) and kernel_size is k, the output is a tensor of shape (N, Lout, C)
         hidden_states = self.avg_pooler(hidden_states)
         hidden_states = self.layer_norm(hidden_states)
 
-        return {'last_hidden_state': hidden_states}
+        # return {'last_hidden_state': hidden_states}
+        return hidden_states
 
 
 class Qwen2AudioMultiModalProjector(nn.Module):
@@ -353,9 +353,8 @@ class Qwen2AudioMultiModalProjector(nn.Module):
         self.linear = nn.Linear(
             config['audio_config']['d_model'], config['text_config']['hidden_size'], bias=True)
 
-    def forward(self, audio_features):
-        hidden_states = self.linear(audio_features)
-        return hidden_states
+    def __call__(self, audio_features):
+        return self.linear(audio_features)
 
 
 class Qwen2Model(nn.Module):
@@ -594,12 +593,12 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
             config_kwargs = json.load(handle)
         Qwen2Config.update(config_kwargs['text_config'])
         config_kwargs['text_config'] = Qwen2Config
-
+        config_kwargs['audio_token_index'] = AUDIO_TOKEN_INDEX
+        self.vocab_size = config_kwargs['text_config']['vocab_size']
+        self.config = config_kwargs
         # self.config = config_kwargs
         self.audio_tower = Qwen2AudioEncoder(config_kwargs['audio_config'])
-        self.multi_modal_projector = Qwen2AudioMultiModalProjector(
-            config_kwargs)
-        self.vocab_size = config_kwargs['text_config']['vocab_size']
+        self.multi_modal_projector = Qwen2AudioMultiModalProjector(config_kwargs)
         self.language_model = Qwen2ForCausalLM(config_kwargs['text_config'])
 
         safetensors = [
@@ -609,7 +608,7 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         mx_weights = {}
         for tensor in safetensors:
             mx_weights.update(mx.load(str(tensor)))
-        # qwen2 default conv1 weight shape from safetensors is [out_channel, in_channel, kernel_size]
+        # qwen2 default layout of conv1.weight from safetensors is [out_channel, in_channel, kernel_size]
         # but mlx conv1 weight shape is [out_channel, kernel_size, in_channel]
         # so a trnaspose is needed before calling load_weights()
         mx_weights = {k: mx.swapaxes(v, 1, 2)
@@ -620,16 +619,24 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         self.load_weights(list(mx_weights.items()))
 
     def __call__(self, input_ids, input_features, **kwargs):
+        audio_index = np.where(np.array(input_ids) == self.config['audio_token_index'])
+        # input_ids's dims is 2, so np.where() returns a tuple of size 2
+        if audio_index[1].size != 1:
+            raise ValueError((
+                "Currently this demo only support 'one' audio stub, "
+                "but you give {audio_index[0].size} audios"))
+
+        special_index = audio_index[1].item()
+        # ipdb.set_trace()
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        audio_features = self.multi_modal_projector(self.audio_tower(input_features))
 
-        input_feature_len = input_features.shape[1]
+        final_features = mx.concatenate([
+            inputs_embeds[:, 0:special_index, :],
+            audio_features,
+            inputs_embeds[:, special_index+1:, :],
+        ], axis=1)
 
-        # input_lengths = (input_feature_len - 1) // 2 + 1
-        # output_lengths = (input_feature_len - 2) // 2 + 1
+        # ipdb.set_trace()
+        return final_features
 
-        audio_outputs = self.audio_tower(input_features)
-        return audio_outputs
-        # print(mx_weights)
-        # self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
-        # # set it to left by default, user can use setter to change padding_sides
-        # self._padding_side = "left"
