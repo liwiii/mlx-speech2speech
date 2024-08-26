@@ -1,6 +1,5 @@
 import ipdb
 import json
-# import math
 from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
@@ -47,7 +46,6 @@ class Qwen2AudioAttention(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.dropout = 0.0
         self.head_dim = embed_dim // num_heads
         self.is_causal = False
         self.config = config
@@ -67,91 +65,30 @@ class Qwen2AudioAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
 
-    # Copied from transformers.models.bart.modeling_bart.BartAttention._shape with BART->whisper
-    # def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-    #     return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
-    def forward(
+    def __call__(
         self,
         hidden_states,
-        key_value_states=None,
-        past_key_value=None,
-        attention_mask=None,
-        layer_head_mask=None,
-        output_attentions: bool = False,
-        cache_position=None,
     ):
         """Input shape: Batch x Time x Channel"""
 
-        # if key_value_states are provided this layer is used as a cross-attention layer
-        # for the decoder
-        is_cross_attention = key_value_states is not None
-        bsz, tgt_len, _ = hidden_states.size()
+        B, L, D = hidden_states.shape
 
-        # get query proj
-        query_states = self._shape(self.q_proj(
-            hidden_states) * self.scaling, tgt_len, bsz)
+        queries = self.q_proj(hidden_states)
+        keys = self.k_proj(hidden_states)
+        values = self.v_proj(hidden_states)
 
-        if past_key_value is not None:
-            is_updated = past_key_value.is_updated.get(self.layer_idx)
-            if is_cross_attention:
-                # after the first generated id, we can subsequently re-use all key/value_states from cache
-                past_key_value.is_updated[self.layer_idx] = True
-                past_key_value = past_key_value.cross_attention_cache
-            else:
-                past_key_value = past_key_value.self_attention_cache
+        # Prepare the queries, keys and values for the attention computation
+        queries = queries.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # use key_value_states if cross attention
-        current_states = key_value_states if key_value_states is not None else hidden_states
-        if is_cross_attention and past_key_value and is_updated:
-            # reuse k,v, cross_attentions
-            key_states = past_key_value.key_cache[self.layer_idx]
-            value_states = past_key_value.value_cache[self.layer_idx]
-        else:
-            key_states = self._shape(self.k_proj(current_states), -1, bsz)
-            value_states = self._shape(self.v_proj(current_states), -1, bsz)
-            if past_key_value is not None:
-                # save all key/value_states to cache to be re-used for fast auto-regressive generation
-                cache_position = cache_position if not is_cross_attention else None
-                key_states, value_states = past_key_value.update(
-                    key_states, value_states, self.layer_idx, {
-                        "cache_position": cache_position}
-                )
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scaling, mask=None
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        attn_output = self.out_proj(output)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
-
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-        if layer_head_mask is not None:
-            if layer_head_mask.size() != (self.num_heads,):
-                raise ValueError((
-                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
-                    f" {layer_head_mask.size()}"
-                ))
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights
-
-        attn_probs = nn.functional.dropout(
-            attn_weights, p=self.dropout, training=self.training)
-        attn_output = torch.matmul(attn_probs, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, tgt_len, self.head_dim):
-            raise ValueError((
-                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            ))
-
-        attn_output = attn_output.transpose(1, 2)
-        # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can be
-        # partitioned across GPUs when using tensor-parallelism.
-        attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
-
-        attn_output = self.out_proj(attn_output)
-
-        return attn_output, attn_weights, past_key_value
+        return attn_output
 
 
 class Attention(nn.Module):
@@ -238,46 +175,25 @@ class Qwen2AudioEncoderLayer(nn.Module):
         self.fc2 = nn.Linear(self.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
-    def forward(
+    def __call__(
         self,
         hidden_states,
-        attention_mask,
-        layer_head_mask,
+        attention_mask=None,
+        layer_head_mask=None,
         output_attentions: bool = False,
     ):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states, attn_weights, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
-        )
-        hidden_states = nn.functional.dropout(
-            hidden_states, p=self.dropout, training=self.training)
+        hidden_states = self.self_attn(hidden_states=hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.activation_fn(self.fc1(hidden_states))
-        hidden_states = nn.functional.dropout(
-            hidden_states, p=self.activation_dropout, training=self.training)
         hidden_states = self.fc2(hidden_states)
-        hidden_states = nn.functional.dropout(
-            hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
-        # if hidden_states.dtype == torch.float16 and (
-        #     torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
-        # ):
-        #     clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-        #     hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs
+        return hidden_states
 
 
 class Qwen2MLP(nn.Module):
@@ -388,6 +304,9 @@ class Qwen2AudioEncoder(nn.Module):
         self.activation_function = config['activation_function']  # gelu
         self.scale_embedding = config['scale_embedding']  # false
         self.max_source_positions = config['max_source_positions']  # 1500
+        print(config)
+
+        self.config = config
 
         self.dropout = 0.0
         self.layerdrop = 0.0
@@ -398,18 +317,34 @@ class Qwen2AudioEncoder(nn.Module):
         self.conv1 = nn.Conv1d(self.num_mel_bins, self.d_model, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(self.d_model, self.d_model, kernel_size=3, stride=2, padding=1)
 
-        self.embed_positions = nn.Embedding(
-            self.max_source_positions, self.d_model)
+        self.embed_positions = nn.Embedding(self.max_source_positions, self.d_model)
         # self.embed_positions.requires_grad_(False)
 
-        self.layers = [Qwen2AudioEncoderLayer(
-            config) for _ in range(self.encoder_layers)]
+        self.layers = [Qwen2AudioEncoderLayer(config) for _ in range(self.encoder_layers)]
         self.layer_norm = nn.LayerNorm(self.d_model)
         # Ignore copy
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
 
-    def __call__(self, mel, tokens):
-        return self.decoder(tokens, self.encoder(mel))[0]
+    def __call__(self, input_features):
+        inputs_embeds = nn.gelu(self.conv1(input_features))
+        inputs_embeds = nn.gelu(self.conv2(inputs_embeds))
+
+        out_len = inputs_embeds.shape[1]
+        hidden_states = inputs_embeds + self.embed_positions.weight[:out_len,:]
+
+        for idx, encoder_layer in enumerate(self.layers):
+            hidden_states = encoder_layer(hidden_states)
+
+        # hidden_states = mx.permute_dims(hidden_states, (0, 2, 1))
+        # hidden_states = self.avg_pooler(hidden_states)
+        # hidden_states = mx.permute_dims(hidden_states, (0, 2, 1))
+
+        # According to https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary/mlx.nn.AvgPool1d.html
+        # Assuming an input of shape (N, L, C) and kernel_size is k, the output is a tensor of shape (N, Lout, C)
+        hidden_states = self.avg_pooler(hidden_states)
+        hidden_states = self.layer_norm(hidden_states)
+
+        return {'last_hidden_state': hidden_states}
 
 
 class Qwen2AudioMultiModalProjector(nn.Module):
@@ -660,6 +595,7 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         Qwen2Config.update(config_kwargs['text_config'])
         config_kwargs['text_config'] = Qwen2Config
 
+        # self.config = config_kwargs
         self.audio_tower = Qwen2AudioEncoder(config_kwargs['audio_config'])
         self.multi_modal_projector = Qwen2AudioMultiModalProjector(
             config_kwargs)
@@ -683,16 +619,16 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         # self.load_weights(list(mx_weights.items()))
         self.load_weights(list(mx_weights.items()))
 
-    def forward(self, input_ids, input_features, **kwargs):
+    def __call__(self, input_ids, input_features, **kwargs):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         input_feature_len = input_features.shape[1]
-        input_lengths = (input_feature_len - 1) // 2 + 1
-        output_lengths = (input_feature_len - 2) // 2 + 1
 
-        print(inputs_embeds)
-        return inputs_embeds
-        # input_embeds = self.audio_tower(input_ids)
+        # input_lengths = (input_feature_len - 1) // 2 + 1
+        # output_lengths = (input_feature_len - 2) // 2 + 1
+
+        audio_outputs = self.audio_tower(input_features)
+        return audio_outputs
         # print(mx_weights)
         # self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         # # set it to left by default, user can use setter to change padding_sides

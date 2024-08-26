@@ -1,3 +1,5 @@
+import ipdb
+import numpy as np
 from mlxs2s.tokenizer import MLXQwen2Tokenizer
 from mlxs2s.feature_extractor import MLXQwen2FeatureExtractor
 from mlxs2s.models import Qwen2AudioForConditionalGeneration
@@ -17,10 +19,12 @@ conversation = [
 ]
 
 mlx_tokenizer = MLXQwen2Tokenizer(QWEN2_AUDIO_MODEL_PATH)
-mlx_input = mlx_tokenizer(TEXT)
-
 mlx_feature_extractor = MLXQwen2FeatureExtractor(QWEN2_AUDIO_MODEL_PATH)
+model = Qwen2AudioForConditionalGeneration(QWEN2_AUDIO_MODEL_PATH)
+model.eval()
 
+
+mlx_input = mlx_tokenizer(TEXT)
 audios = []
 for message in conversation:
     if isinstance(message["content"], list):
@@ -30,8 +34,11 @@ for message in conversation:
                     librosa.load(ele['audio_url'], sr=mlx_feature_extractor.sampling_rate)[0]
                 )
 
-mlx_input["input_features"] = mlx_feature_extractor(audios).T[None,]  # [1,feature_dim, feature_num]
+audios[0] = np.pad(audios[0], [200, 200], mode='reflect')  # in order to be compatible with torch.stft() with center=True
+# mlx_input["input_features"] = mlx_feature_extractor(audios).T[None,]  # [1,feature_dim, feature_num]
+
+# [1, ] is necessary
+mlx_input["input_features"] = mlx_feature_extractor(audios)[None,].astype(mx.bfloat16)  # [1, feature_num, feature_dim]
 mlx_input["feature_attention_mask"] = mx.ones([mlx_input["input_features"].shape[2]], dtype=mx.int32)
 
-
-model = Qwen2AudioForConditionalGeneration(QWEN2_AUDIO_MODEL_PATH)
+out = model(**mlx_input)

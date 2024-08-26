@@ -91,9 +91,11 @@ model_inputs = BatchFeature(data={**inputs}).to('mps')
 # model_encoder = Qwen2AudioEncoder._from_config(model_config.audio_config)
 # multi_modal_projector = Qwen2AudioMultiModalProjector(model_config)
 
-model = Qwen2AudioForConditionalGeneration.from_pretrained(QWEN2_AUDIO_MODEL_PATH, torch_dtype=torch.float16)
+model = Qwen2AudioForConditionalGeneration.from_pretrained(QWEN2_AUDIO_MODEL_PATH, torch_dtype=torch.bfloat16)
 model = model.to('mps')
+ipdb.set_trace()
 generate_ids = model.generate(**model_inputs, max_length=512)
+ipdb.set_trace()
 generate_ids = generate_ids[:, inputs.input_ids.size(1):]
 
 response = tokenizer.batch_decode(
