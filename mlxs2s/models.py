@@ -3,6 +3,7 @@ import ipdb
 import json
 from pathlib import Path
 from typing import Generator, Tuple
+from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 from .utils import (
@@ -229,9 +230,7 @@ class Qwen2DecoderLayer(nn.Module):
         kv_cache,
     ):
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
-
         # Self Attention
         hidden_states = self.self_attn(
             hidden_states,
@@ -239,22 +238,12 @@ class Qwen2DecoderLayer(nn.Module):
             kv_cache
         )
         hidden_states = residual + hidden_states
-
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # outputs = hidden_states
-
-        # if output_attentions:
-        #     outputs += (self_attn_weights,)
-        #
-        # if use_cache:
-        #     outputs += (present_key_value,)
-
-        # ipdb.set_trace()
         return hidden_states
 
 
@@ -454,16 +443,22 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
 
         generation_config_file = check_file(Path(model_path)/'generation_config.json')
         with open(generation_config_file, encoding="utf-8") as handle:
-            self.generation_config = json.load(handle)
+            self.gen_config = json.load(handle)
 
         self.n_kv_heads = config_kwargs['text_config']['num_key_value_heads']
         self.hidden_dim = config_kwargs['text_config']['hidden_size']
         self.layers = config_kwargs['text_config']['num_hidden_layers']
         self.head_dim = self.hidden_dim // self.n_kv_heads
 
+        self.repetition_penalty = self.gen_config['repetition_penalty']
+        self.temperature = self.gen_config['temperature']
+        self.topK = self.gen_config['top_k']
+        self.topP = self.gen_config['top_p']
+        self.eos_ids = self.gen_config['eos_token_id']
+
         self.audio_tower = Qwen2AudioEncoder(config_kwargs['audio_config'])
         self.multi_modal_projector = Qwen2AudioMultiModalProjector(config_kwargs)
-        self.language_model = Qwen2ForCausalLM(config_kwargs['text_config'], self.generation_config)
+        self.language_model = Qwen2ForCausalLM(config_kwargs['text_config'], self.gen_config)
 
         safetensors = [
             str(Path(model_path) / f'model-0000{i}-of-00005.safetensors')
@@ -480,6 +475,32 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
                     for k, v in mx_weights.items()}
 
         self.load_weights(list(mx_weights.items()))
+
+    # @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+    def sample(self, input_ids, logits):
+        logprobs = logits - mx.logsumexp(logits)
+
+        score = mx.take(logprobs, input_ids)
+        score = mx.where(score < 0, score * self.repetition_penalty, score / self.repetition_penalty)
+        logprobs[0, input_ids[0]] = score  # TODO: alternative approach??
+
+        # apply temperature
+        logprobs = logprobs * (1.0 / self.temperature)
+        probs = mx.softmax(logprobs, axis=-1)
+        # apply topK
+        sorted_indices = mx.argsort(probs, axis=-1).squeeze(0)[-self.topK:]
+        sorted_probs = probs[..., sorted_indices]
+        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+        # apply topP
+        top_probs = mx.where(
+            cumulative_probs > 1 - self.topP,
+            sorted_probs,
+            0,
+        )
+        sorted_token = mx.random.categorical(mx.log(top_probs))
+        token = sorted_indices[sorted_token]
+
+        return token[None], probs[0, token]
 
     def context(self, input_ids, input_features, kv_cache):
         audio_index = np.where(np.array(input_ids) == AUDIO_TOKEN_INDEX)
@@ -503,10 +524,15 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         out = self.language_model(final_features, kv_cache)
         return out
 
-    def generate_step(self,
+    def forward(self, dec_id, kv_cache):
+        inputs_embeds = self.language_model.model.embed_tokens(dec_id)
+        return self.language_model(inputs_embeds, kv_cache)
+
+    def generate_step(
+        self,
         input_ids: mx.array,
-        input_features: mx.array,
-    ) -> Generator[Tuple[mx.array, mx.array], None, None]:
+        input_features: mx.array
+    ):
         y = input_ids
         kv_cache = [
             KVCache(self.head_dim, self.n_kv_heads)
@@ -515,39 +541,28 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
 
         repetition_context = input_ids[0, :].tolist()  #TODO: multi-batch support
 
-        # def _step(y):
-        #     nonlocal repetition_context
-        #     logits = forward(input_ids, input_features, kv_cache=kv_cache)
-        #     logits = logits[:, -1, :]
-        #
-        #     logits = apply_repetition_penalty(
-        #         logits, repetition_context, repetition_penalty
-        #     )
-        #     y, logprobs = sample(logits)
-        #     repetition_context.append(y.item())
-        #
-        #     return y, logprobs.squeeze(0)
-
-        ipdb.set_trace()
-        # y, logprobs = self.context(input_features, kv_cache)
-        y = self.context(input_ids, input_features, kv_cache)
-
+        logits = self.context(input_ids, input_features, kv_cache)
+        y, logprobs = self.sample(input_ids, logits)
         mx.async_eval(y)
-        ipdb.set_trace()
-        yield y.item(), 1.0
-
-        '''
+        # ipdb.set_trace()
+        repetition_context.append(y.item())
         while True:
-            next_y, next_logprobs = _step(y)
+            logits = self.forward(y, kv_cache)
+            next_y, next_logprobs = self.sample(input_ids, logits)
             mx.async_eval(next_y)
             yield y.item(), logprobs
             y, logprobs = next_y, next_logprobs
-        '''
+            repetition_context.append(y.item())
 
     def __call__(self, input_ids, input_features, max_decoder_tokens):
+        output_tokens = []
         for (token, logprobs), n in zip(
             self.generate_step(input_ids, input_features),
             range(max_decoder_tokens),
         ):
-            print(f"DEBUG: {n}")
+            # print(f"DEBUG: {token}")
+            output_tokens.append(token)
+            if token in self.eos_ids:
+                break
 
+        return output_tokens

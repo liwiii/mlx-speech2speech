@@ -42,4 +42,16 @@ audios[0] = np.pad(audios[0], [200, 200], mode='reflect')  # in order to be comp
 input_features = mlx_feature_extractor(audios)  # [1, feature_num, feature_dim]
 mx.async_eval(input_features)
 
-model(input_ids=input_ids, input_features=input_features, max_decoder_tokens=256)
+# s = time.time()
+print("start decoding...", flush=True)
+output_tokens = model(input_ids=input_ids, input_features=input_features, max_decoder_tokens=256)
+# print(f"cost {time.time()-s} sec.")
+print(output_tokens, flush=True)
+# ipdb.set_trace()
+out_str = mlx_tokenizer.tokenizer.decode(
+            output_tokens,
+            skip_special_tokens=True)[0]
+
+print(out_str)
+
+
