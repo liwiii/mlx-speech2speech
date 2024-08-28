@@ -176,4 +176,4 @@ class MLXQwen2FeatureExtractor:
         return log_spec
 
     def __call__(self, raw_speech):
-        return self._mlx_extract_fbank_features(raw_speech[0])
+        return self._mlx_extract_fbank_features(raw_speech[0])[None,].astype(mx.bfloat16)

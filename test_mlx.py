@@ -1,4 +1,5 @@
 import ipdb
+import time
 import numpy as np
 from mlxs2s.tokenizer import MLXQwen2Tokenizer
 from mlxs2s.feature_extractor import MLXQwen2FeatureExtractor
@@ -21,11 +22,10 @@ conversation = [
 mlx_tokenizer = MLXQwen2Tokenizer(QWEN2_AUDIO_MODEL_PATH)
 mlx_feature_extractor = MLXQwen2FeatureExtractor(QWEN2_AUDIO_MODEL_PATH)
 model = Qwen2AudioForConditionalGeneration(QWEN2_AUDIO_MODEL_PATH)
-model.eval()
 
+input_ids = mlx_tokenizer(TEXT)
+mx.async_eval(input_ids)
 
-mlx_input = mlx_tokenizer(TEXT)
-# ipdb.set_trace()
 audios = []
 for message in conversation:
     if isinstance(message["content"], list):
@@ -39,7 +39,7 @@ audios[0] = np.pad(audios[0], [200, 200], mode='reflect')  # in order to be comp
 # mlx_input["input_features"] = mlx_feature_extractor(audios).T[None,]  # [1,feature_dim, feature_num]
 
 # [1, ] is necessary
-mlx_input["input_features"] = mlx_feature_extractor(audios)[None,].astype(mx.bfloat16)  # [1, feature_num, feature_dim]
-mlx_input["feature_attention_mask"] = mx.ones([mlx_input["input_features"].shape[2]], dtype=mx.int32)
+input_features = mlx_feature_extractor(audios)  # [1, feature_num, feature_dim]
+mx.async_eval(input_features)
 
-out = model(**mlx_input)
+model(input_ids=input_ids, input_features=input_features, max_decoder_tokens=256)

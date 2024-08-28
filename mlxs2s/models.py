@@ -1,9 +1,16 @@
 import ipdb
+# import time
 import json
 from pathlib import Path
+from typing import Generator, Tuple
 import mlx.core as mx
 import mlx.nn as nn
-from mlxs2s.utils import check_file
+from .utils import (
+        check_file,
+        KVCache,
+        create_attention_mask
+)
+from .sample_utils import top_p_sampling
 import numpy as np
 
 ACT2FN = {
@@ -33,30 +40,6 @@ Qwen2Config = {
     'attention_dropout': 0.0,
     'pad_token_id': None,
 }
-
-
-def create_additive_causal_mask(N: int, offset: int = 0):
-    rinds = mx.arange(offset + N)
-    linds = mx.arange(offset, offset + N) if offset else rinds
-    mask = linds[:, None] < rinds[None]
-    return mask * -1e9
-
-# class Qwen2RotaryEmbedding(nn.Module):
-#     def __init__(self, dim, max_position_embeddings, base):
-#         super().__init__()
-#         inv_freq = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
-#         t = mx.arange(max_position_embeddings, dtype=mx.float32)
-#         freqs = mx.outer(t, inv_freq)
-#         emb = mx.concatenate([freqs, freqs], dim=-1)
-#
-#         self.cos_cached = emb.cos().astype(mx.bfloat16)
-#         self.sin_cached = emb.sin().astype(mx.bfloat16)
-#
-#     def __call__(self, seq_len):
-#         return (
-#             self.cos_cached[:seq_len],
-#             self.sin_cached[:seq_len]
-#         )
 
 
 class Qwen2AudioAttention(nn.Module):
@@ -142,23 +125,12 @@ class Qwen2Attention(nn.Module):
                         scale=1.0)
 
         self.mask = None
-        # rope_scale = (
-        #     1 / args.rope_scaling["factor"]
-        #     if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
-        #     else 1
-        # )
-        # rope_scale = 1
-        # self.rotary_emb = Qwen2RotaryEmbedding(
-        #     self.head_dim,
-        #     max_position_embeddings=self.max_position_embeddings,
-        #     base=self.rope_theta,
-        # )
 
     def __call__(
         self,
         x: mx.array,
-        mask=None,
-        cache=None,
+        mask,
+        kv_cache,
     ) -> mx.array:
         B, L, D = x.shape
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -167,18 +139,20 @@ class Qwen2Attention(nn.Module):
         keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # ipdb.set_trace()
-        if cache is not None:
-            raise RuntimeError("not implemented yet~")
-        #     queries = self.rope(queries, offset=cache.offset)
-        #     keys = self.rope(keys, offset=cache.offset)
-        #     keys, values = cache.update_and_fetch(keys, values)
+        if kv_cache is not None:
+            queries = self.rope(queries, offset=kv_cache.offset)
+            keys = self.rope(keys, offset=kv_cache.offset)
+            keys, values = kv_cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        # output = mx.fast.scaled_dot_product_attention(
+        #     queries, keys, values, scale=self.scale, mask=mask
+        # )
         output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+            queries, keys, values,
+            scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, self.hidden_dim)
         return self.o_proj(output)
@@ -228,40 +202,15 @@ class Qwen2MLP(nn.Module):
         super().__init__()
         self.hidden_size = config['hidden_size']
         self.intermediate_size = config['intermediate_size']
-        self.gate_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config['hidden_act']]()
 
     def __call__(self, hidden_state):
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
-
-
-#  better choice: mlx.nn.RMSNorm
-#
-# class Qwen2RMSNorm(nn.Module):
-#     def __init__(self, hidden_size, eps=1e-6):
-#         """
-#         Qwen2RMSNorm is equivalent to T5LayerNorm
-#         """
-#         super().__init__()
-#         # self.weight = nn.Parameter(mx.ones(hidden_size))
-#         self.weight = mx.ones(hidden_size)
-#         self.variance_epsilon = eps
-#
-#     def __call__(self, hidden_states):
-#         input_dtype = hidden_states.dtype
-#         hidden_states = hidden_states.to(mx.float32)
-#         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-#         hidden_states = hidden_states * \
-#             mx.rsqrt(variance + self.variance_epsilon)
-#         return self.weight * hidden_states.to(input_dtype)
-#
-#     def extra_repr(self):
-#         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state)
+        )
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -270,20 +219,14 @@ class Qwen2DecoderLayer(nn.Module):
 
         self.self_attn = Qwen2Attention(config, layer_idx)
         self.mlp = Qwen2MLP(config)
-        # self.input_layernorm = Qwen2RMSNorm(config['hidden_size'], eps=config['rms_norm_eps'])
         self.input_layernorm = nn.RMSNorm(config['hidden_size'], eps=config['rms_norm_eps'])
-        # self.post_attention_layernorm = Qwen2RMSNorm(config['hidden_size'], eps=config['rms_norm_eps'])
         self.post_attention_layernorm = nn.RMSNorm(config['hidden_size'], eps=config['rms_norm_eps'])
 
     def __call__(
         self,
         hidden_states,
         attention_mask,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        cache_position=None,
+        kv_cache,
     ):
         residual = hidden_states
 
@@ -292,7 +235,8 @@ class Qwen2DecoderLayer(nn.Module):
         # Self Attention
         hidden_states = self.self_attn(
             hidden_states,
-            attention_mask
+            attention_mask,
+            kv_cache
         )
         hidden_states = residual + hidden_states
 
@@ -302,7 +246,7 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        # outputs = hidden_states
 
         # if output_attentions:
         #     outputs += (self_attn_weights,)
@@ -311,13 +255,12 @@ class Qwen2DecoderLayer(nn.Module):
         #     outputs += (present_key_value,)
 
         # ipdb.set_trace()
-        return outputs
+        return hidden_states
 
 
 class Qwen2AudioEncoder(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
-
         self.num_mel_bins = config['num_mel_bins']  # 128
         self.encoder_layers = config['encoder_layers']  # 32
         self.encoder_attention_heads = config['encoder_attention_heads']  # 20
@@ -326,24 +269,19 @@ class Qwen2AudioEncoder(nn.Module):
         self.activation_function = config['activation_function']  # gelu
         self.scale_embedding = config['scale_embedding']  # false
         self.max_source_positions = config['max_source_positions']  # 1500
-
         self.config = config
 
-        self.dropout = 0.0
-        self.layerdrop = 0.0
+        # self.dropout = 0.0
+        # self.layerdrop = 0.0
 
         # self.padding_idx = config.pad_token_id
-        self.embed_scale = 1.0
+        # self.embed_scale = 1.0
 
         self.conv1 = nn.Conv1d(self.num_mel_bins, self.d_model, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(self.d_model, self.d_model, kernel_size=3, stride=2, padding=1)
-
         self.embed_positions = nn.Embedding(self.max_source_positions, self.d_model)
-        # self.embed_positions.requires_grad_(False)
-
         self.layers = [Qwen2AudioEncoderLayer(config) for _ in range(self.encoder_layers)]
         self.layer_norm = nn.LayerNorm(self.d_model)
-        # Ignore copy
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
 
     def __call__(self, input_features):
@@ -351,17 +289,17 @@ class Qwen2AudioEncoder(nn.Module):
         inputs_embeds = nn.gelu(self.conv2(inputs_embeds))
 
         out_len = inputs_embeds.shape[1]
-        hidden_states = inputs_embeds + self.embed_positions.weight[:out_len,:]
+        hidden_states = inputs_embeds + self.embed_positions.weight[:out_len, :]
 
         for idx, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(hidden_states)
 
         # According to https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary/mlx.nn.AvgPool1d.html
         # Assuming an input of shape (N, L, C) and kernel_size is k, the output is a tensor of shape (N, Lout, C)
-        hidden_states = self.avg_pooler(hidden_states)
-        hidden_states = self.layer_norm(hidden_states)
+        # hidden_states = self.avg_pooler(hidden_states)
+        # hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.layer_norm(self.avg_pooler(hidden_states))
 
-        # return {'last_hidden_state': hidden_states}
         return hidden_states
 
 
@@ -379,6 +317,10 @@ class Qwen2Model(nn.Module):
         super().__init__()
         # self.padding_idx = config['pad_token_id'
         self.vocab_size = config['vocab_size']
+        self.n_kv_heads = config['num_key_value_heads']
+        self.hidden_dim = config['hidden_size']
+        self.head_dim = self.hidden_dim // self.n_kv_heads
+        self.n_layers = config['num_hidden_layers']
 
         self.embed_tokens = nn.Embedding(config['vocab_size'], config['hidden_size'])
         self.layers = [
@@ -396,162 +338,132 @@ class Qwen2Model(nn.Module):
 
     def __call__(
         self,
-        inputs_embeds,
-        attention_mask,
-        position_ids=None,
-        past_key_values=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        cache_position=None,
+        inputs: mx.array,
+        kv_cache,
     ):
+        hidden_states = inputs
+        mask = create_attention_mask(hidden_states, kv_cache)
 
-        hidden_states = inputs_embeds
-        next_decoder_cache = None
+        if kv_cache is None:
+            kv_cache = [None] * len(self.n_layers)
 
-        for decoder_layer in self.layers:
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask,
-                # position_ids=position_ids,
-                # past_key_value=past_key_values,
-                # output_attentions=output_attentions,
-                # use_cache=use_cache,
-                # cache_position=cache_position,
-            )
-            hidden_states = layer_outputs[0]
+        for layer, c in zip(self.layers, kv_cache):
+            hidden_states = layer(hidden_states, mask, c)
 
-            # if use_cache:
-            #     next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-            #
-            # if output_attentions:
-            #     all_self_attns += (layer_outputs[1],)
-
-        hidden_states = self.norm(hidden_states)
-
-        # add hidden states from the last decoder layer
-        # if output_hidden_states:
-        #     all_hidden_states += (hidden_states,)
-
-        # next_cache = None
-        # if use_cache:
-        #     next_cache = next_decoder_cache.to_legacy_cache(
-        #     ) if use_legacy_cache else next_decoder_cache
-
-        # if not return_dict:
-        #     return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-        # return BaseModelOutputWithPast(
-        #     last_hidden_state=hidden_states,
-        #     past_key_values=next_cache,
-        #     hidden_states=all_hidden_states,
-        #     attentions=all_self_attns,
-        # )
-        return hidden_states
+        return self.norm(hidden_states)
 
 
 class Qwen2ForCausalLM(nn.Module):
-    # _tied_weights_keys = ["lm_head.weight"]
-
-    def __init__(self, config):
+    def __init__(self, config: dict, gen_config: dict):
         super().__init__()
-        self.model = Qwen2Model(config)
-        self.lm_head = nn.Linear(config['hidden_size'], config['vocab_size'], bias=False)
+        hidden_size = config['hidden_size']
+        vocab_size = config['vocab_size']
+        self.gen_config = gen_config
+        self.repetition_penalty = self.gen_config['repetition_penalty']
+        self.temperature = self.gen_config['temperature']
+        self.topK = self.gen_config['top_k']
+        self.topP = self.gen_config['top_p']
 
-    # def get_input_embeddings(self):
-    #     return self.model.embed_tokens
-    #
-    # def set_input_embeddings(self, value):
-    #     self.model.embed_tokens = value
-    #
-    # def get_output_embeddings(self):
-    #     return self.lm_head
-    #
-    # def set_output_embeddings(self, new_embeddings):
-    #     self.lm_head = new_embeddings
-    #
-    # def set_decoder(self, decoder):
-    #     self.model = decoder
-    #
-    # def get_decoder(self):
-    #     return self.model
+        self.model = Qwen2Model(config)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def __call__(
         self,
-        inputs_embeds,
-        attention_mask,
-        position_ids=None,
-        past_key_values=None,
-        labels=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        cache_position=None,
+        inputs: mx.array,
+        kv_cache 
     ):
+        outputs = self.model(inputs, kv_cache)
+
+        # hidden_states = outputs[:, -1, :]  # (batch_size, seq_len, hidden_dim) -> (batch_size, hidden_dim)
+        return self.lm_head(outputs[:, -1, :])
+
+        '''
+        # apply penalty rectification
+        score = mx.take(logits, input_ids)
+        score = mx.where(score < 0, score * self.repetition_penalty, score / self.repetition_penalty)
+        logits[0, input_ids[0]] = score  # TODO: alternative approach??
+
+        # apply temperature
+        logits = logits * (1.0 / self.temperature)
+
+        # apply topK
+        inds = mx.stop_gradient(mx.argpartition(-logits, kth=self.topK-1, axis=-1)[..., :self.topK])
+
+        # apply topP
+        inds = inds[:, ::-1]  # topK index with scores from low to high
         # ipdb.set_trace()
-        outputs = self.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            # position_ids=position_ids,
-            # past_key_values=past_key_values,
-            # use_cache=use_cache,
-            # output_attentions=output_attentions,
-            # output_hidden_states=output_hidden_states,
-            # return_dict=return_dict,
-            # cache_position=cache_position,
-        )
-        # return outputs
-
-        hidden_states = outputs[:, -1:, :]  # (batch_size, seq_len, hidden_dim)
-        logits = self.lm_head(hidden_states)
-        # logits = logits.float()
+        topp_inds = (mx.cumsum(mx.softmax(mx.take_along_axis(logits, inds, axis=-1), axis=-1), axis=-1) > self.topP)
 
         # ipdb.set_trace()
-        
-        return logits
+        # return inds[0, -1]  # OK
+        max_len = 1
+        o_token = inds[0, -1].item()
 
-        # loss = None
-        # if labels is not None:
-        #     # Shift so that tokens < n predict n
-        #     shift_logits = logits[..., :-1, :].contiguous()
-        #     shift_labels = labels[..., 1:].contiguous()
-        #     # Flatten the tokens
-        #     loss_fct = CrossEntropyLoss()
-        #     shift_logits = shift_logits.view(-1, self.config.vocab_size)
-        #     shift_labels = shift_labels.view(-1)
-        #     # Enable model parallelism
-        #     shift_labels = shift_labels.to(shift_logits.device)
-        #     loss = loss_fct(shift_logits, shift_labels)
-        #
-        # if not return_dict:
-        #     output = (logits,) + outputs[1:]
-        #     return (loss,) + output if loss is not None else output
-        #
-        # return CausalLMOutputWithPast(
-        #     loss=loss,
-        #     logits=logits,
-        #     past_key_values=outputs.past_key_values,
-        #     hidden_states=outputs.hidden_states,
-        #     attentions=outputs.attentions,
-        # )
+        o_tokens = []
+        o_tokens.append(o_token)
 
+        B, L, H = inputs_embeds.shape
+        cache_len = L
+        # self.inputs_embeds = mx.zeros([B, L+128, H], dtype=mx.bfloat16)
+        # self.inputs_embeds[:, L, :] = self.language_model.model.embed_tokens(inds[:, -1:])
+        while (max_len < 128) and (o_token not in self.gen_config['eos_token_id']):
+            print("enter")
+            decode_input_embed = self.model.embed_tokens(inds[:, -1:])
+            print(decode_input_embed.shape)
+            hidden_states, kv_caches = self.model(
+                inputs_embeds=decode_input_embed,
+                attention_mask=None,
+                kv_caches=kv_caches,
+                cache_len=cache_len
+            )
+            cache_len += 1
+            # hidden_states = outputs[:, -1, :]  # (batch_size, seq_len, hidden_dim) -> (batch_size, hidden_dim)
+            logits = self.lm_head(hidden_states[:, -1, :])
+            # apply penalty rectification
+            score = mx.take(logits, input_ids)
+            score = mx.where(score < 0, score * self.repetition_penalty, score / self.repetition_penalty)
+            logits[0, input_ids[0]] = score  # TODO: alternative approach??
+            # apply temperature
+            logits = logits * (1.0 / self.temperature)
+            # apply topK
+            inds = mx.stop_gradient(mx.argpartition(-logits, kth=self.topK-1, axis=-1)[..., :self.topK])
+            # apply topP
+            inds = inds[:, ::-1]  # topK index with scores from low to high
+            o_token = inds[0, -1].item()
+            o_tokens.append(o_token)
+            print(o_tokens)
+
+        return o_tokens
+        # inds = inds[:, -mx.sum(topp_inds, axis=-1):][:, ::-1]
+        # final_logits = mx.take_along_axis(logits, inds, axis=-1)
+        #
+        # return final_logits
+        '''
 
 class Qwen2AudioForConditionalGeneration(nn.Module):
     def __init__(self, model_path: str):
         super().__init__()
-        preprocessor_config_file = check_file(Path(model_path)/'config.json')
-        with open(preprocessor_config_file, encoding="utf-8") as handle:
+        config_file = check_file(Path(model_path)/'config.json')
+        with open(config_file, encoding="utf-8") as handle:
             config_kwargs = json.load(handle)
         Qwen2Config.update(config_kwargs['text_config'])
         config_kwargs['text_config'] = Qwen2Config
-        config_kwargs['audio_token_index'] = AUDIO_TOKEN_INDEX
+        # config_kwargs['audio_token_index'] = AUDIO_TOKEN_INDEX
         # self.vocab_size = config_kwargs['text_config']['vocab_size']
         self.config = config_kwargs
 
+        generation_config_file = check_file(Path(model_path)/'generation_config.json')
+        with open(generation_config_file, encoding="utf-8") as handle:
+            self.generation_config = json.load(handle)
+
+        self.n_kv_heads = config_kwargs['text_config']['num_key_value_heads']
+        self.hidden_dim = config_kwargs['text_config']['hidden_size']
+        self.layers = config_kwargs['text_config']['num_hidden_layers']
+        self.head_dim = self.hidden_dim // self.n_kv_heads
+
         self.audio_tower = Qwen2AudioEncoder(config_kwargs['audio_config'])
         self.multi_modal_projector = Qwen2AudioMultiModalProjector(config_kwargs)
-        self.language_model = Qwen2ForCausalLM(config_kwargs['text_config'])
+        self.language_model = Qwen2ForCausalLM(config_kwargs['text_config'], self.generation_config)
 
         safetensors = [
             str(Path(model_path) / f'model-0000{i}-of-00005.safetensors')
@@ -560,23 +472,22 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         mx_weights = {}
         for tensor in safetensors:
             mx_weights.update(mx.load(str(tensor)))
-        # qwen2 default layout of conv1.weight from safetensors is [out_channel, in_channel, kernel_size]
+        # qwen2's default conv1.weight layout from safetensors is [out_channel, in_channel, kernel_size]
         # but mlx conv1 weight shape is [out_channel, kernel_size, in_channel]
         # so a trnaspose is needed before calling load_weights()
         mx_weights = {k: mx.swapaxes(v, 1, 2)
                     if "conv1.weight" in k or "conv2.weight" in k else v
                     for k, v in mx_weights.items()}
 
-        # self.load_weights(list(mx_weights.items()))
         self.load_weights(list(mx_weights.items()))
 
-    def __call__(self, input_ids, input_features, **kwargs):
-        audio_index = np.where(np.array(input_ids) == self.config['audio_token_index'])
+    def context(self, input_ids, input_features, kv_cache):
+        audio_index = np.where(np.array(input_ids) == AUDIO_TOKEN_INDEX)
         # input_ids's dims is 2, so np.where() returns a tuple of size 2
         if audio_index[1].size != 1:
             raise ValueError((
                 "Currently this demo only support 'ONE' audio stub, "
-                "but you give {audio_index[0].size} audios"))
+                f"but you give {audio_index[1].size} audios"))
 
         special_index = audio_index[1].item()
         # ipdb.set_trace()
@@ -589,10 +500,54 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
             inputs_embeds[:, special_index+1:, :],
         ], axis=1)
 
-        # ipdb.set_trace()
-        feat_len = final_features.shape[1]
-        causal_mask = create_additive_causal_mask(feat_len).astype(mx.bfloat16)
-        ipdb.set_trace()
-        out = self.language_model(inputs_embeds=final_features, attention_mask=causal_mask)
+        out = self.language_model(final_features, kv_cache)
         return out
+
+    def generate_step(self,
+        input_ids: mx.array,
+        input_features: mx.array,
+    ) -> Generator[Tuple[mx.array, mx.array], None, None]:
+        y = input_ids
+        kv_cache = [
+            KVCache(self.head_dim, self.n_kv_heads)
+            for _ in range(self.layers)
+        ]
+
+        repetition_context = input_ids[0, :].tolist()  #TODO: multi-batch support
+
+        # def _step(y):
+        #     nonlocal repetition_context
+        #     logits = forward(input_ids, input_features, kv_cache=kv_cache)
+        #     logits = logits[:, -1, :]
+        #
+        #     logits = apply_repetition_penalty(
+        #         logits, repetition_context, repetition_penalty
+        #     )
+        #     y, logprobs = sample(logits)
+        #     repetition_context.append(y.item())
+        #
+        #     return y, logprobs.squeeze(0)
+
+        ipdb.set_trace()
+        # y, logprobs = self.context(input_features, kv_cache)
+        y = self.context(input_ids, input_features, kv_cache)
+
+        mx.async_eval(y)
+        ipdb.set_trace()
+        yield y.item(), 1.0
+
+        '''
+        while True:
+            next_y, next_logprobs = _step(y)
+            mx.async_eval(next_y)
+            yield y.item(), logprobs
+            y, logprobs = next_y, next_logprobs
+        '''
+
+    def __call__(self, input_ids, input_features, max_decoder_tokens):
+        for (token, logprobs), n in zip(
+            self.generate_step(input_ids, input_features),
+            range(max_decoder_tokens),
+        ):
+            print(f"DEBUG: {n}")
 
