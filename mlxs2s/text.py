@@ -6,6 +6,22 @@ Stay alert and cautious, What does the person say? Audio 1: <|audio_bos|><|AUDIO
 <|im_start|>assistant
 '''
 
+TEXT2 = '''<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Stay alert and cautious, recognize the speech from audio. Audio 1: <|audio_bos|><|AUDIO|><|audio_eos|>
+<|im_end|>
+<|im_start|>assistant
+'''
+
+TEXT3 = '''<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Stay alert and cautious, recognize the speech from audio and translate into Japanese. Audio 1: <|audio_bos|><|AUDIO|><|audio_eos|>
+<|im_end|>
+<|im_start|>assistant
+'''
+
 DEFAULT_CHAT_TEMPLATE = (
             "{% set audio_count = namespace(value=0) %}"
             "{% for message in messages %}"

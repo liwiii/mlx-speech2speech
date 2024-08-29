@@ -556,13 +556,15 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
 
     def __call__(self, input_ids, input_features, max_decoder_tokens):
         output_tokens = []
+        print('[', end='')
         for (token, logprobs), n in zip(
             self.generate_step(input_ids, input_features),
             range(max_decoder_tokens),
         ):
-            # print(f"DEBUG: {token}")
+            print(f"{token}, ", flush=True, end='')
             output_tokens.append(token)
             if token in self.eos_ids:
+                print(']', flush=True)
                 break
 
         return output_tokens
