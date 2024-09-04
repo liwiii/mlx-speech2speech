@@ -48,7 +48,8 @@ conversation = [
     {'role': 'system', 'content': 'You are a helpful assistant.'},
     {"role": "user", "content": [
         {"type": "text", "text": "Stay alert and cautious, What does the person say?"},
-        {"type": "audio", "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/1272-128104-0000.flac"},
+        # {"type": "audio", "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/1272-128104-0000.flac"},
+        {"type": "audio", "audio_url": "my_voice.wav"},
     ]},
 ]
 
@@ -71,7 +72,8 @@ for message in conversation:
         for ele in message["content"]:
             if ele["type"] == "audio":
                 audios.append(
-                    librosa.load(BytesIO(urlopen(ele['audio_url']).read()),
+                    # librosa.load(BytesIO(urlopen(ele['audio_url']).read()),
+                    librosa.load(ele['audio_url'],
                                     sr=feature_extractor.sampling_rate)[0])
 
 inputs = tokenizer(text, padding=True, return_tensors="pt")
@@ -93,9 +95,9 @@ model_inputs = BatchFeature(data={**inputs}).to('mps')
 
 model = Qwen2AudioForConditionalGeneration.from_pretrained(QWEN2_AUDIO_MODEL_PATH, torch_dtype=torch.bfloat16)
 model = model.to('mps')
-ipdb.set_trace()
+# ipdb.set_trace()
 generate_ids = model.generate(**model_inputs, max_length=512)
-ipdb.set_trace()
+# ipdb.set_trace()
 generate_ids = generate_ids[:, inputs.input_ids.size(1):]
 
 response = tokenizer.batch_decode(
